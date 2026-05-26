@@ -1,4 +1,5 @@
-FROM php:8.5.6-apache
+ARG PHP_TAG=8.5-apache
+FROM php:${PHP_TAG}
 
 # Combine RUN commands to reduce layers and clean up in same layer
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -104,6 +105,7 @@ opcache.huge_code_pages=1\n\
 opcache.validate_timestamps=0\n\
 opcache.revalidate_freq=0\n' > /usr/local/etc/php/conf.d/opcache-prod.ini
 
+ARG PHP_TAG
 LABEL Author="tracyhatemice"
-LABEL Version="php:8.5.6-apache"
+LABEL Version="php:${PHP_TAG}"
 LABEL Description="PHP Apache environment (hardened)"

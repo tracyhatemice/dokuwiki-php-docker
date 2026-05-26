@@ -1,0 +1,133 @@
+name: Build PHP-Apache image
+
+on:
+  schedule:
+    # Daily at 00:00 UTC
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    inputs:
+      php_tag:
+        description: 'PHP base image tag (e.g. 8.5-apache, 8.4-apache, 8-apache)'
+        default: '8.5-apache'
+        required: true
+      force:
+        description: 'Build & push even if base image unchanged'
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - 'Dockerfile'
+      - '.github/workflows/build-image.yml'
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  PHP_TAG: ${{ inputs.php_tag || '8.5-apache' }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve latest base image digest
+        id: base
+        run: |
+          set -euo pipefail
+          BASE_DIGEST=$(docker buildx imagetools inspect "php:${PHP_TAG}" \
+            --format '{{json .Manifest}}' | jq -r '.digest')
+          echo "Base php:${PHP_TAG} digest: ${BASE_DIGEST}"
+          echo "digest=${BASE_DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether build is needed
+        id: decide
+        env:
+          IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          NEW_BASE: ${{ steps.base.outputs.digest }}
+          EVENT: ${{ github.event_name }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          if [ "${EVENT}" != "schedule" ] || [ "${FORCE}" = "true" ]; then
+            echo "Trigger=${EVENT} force=${FORCE}: build."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Schedule trigger: skip if previous build used the same base digest.
+          if ! docker pull "${IMAGE_REF}" >/dev/null 2>&1; then
+            echo "No previous :latest in registry; building."
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          PREV=$(docker inspect "${IMAGE_REF}" \
+            --format '{{ index .Config.Labels "org.opencontainers.image.base.digest" }}' \
+            2>/dev/null || true)
+          echo "Previous base digest: ${PREV:-<none>}"
+          echo "Current  base digest: ${NEW_BASE}"
+          if [ -n "${PREV}" ] && [ "${PREV}" = "${NEW_BASE}" ]; then
+            echo "Base unchanged; skipping rebuild."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve PHP version from base image
+        if: steps.decide.outputs.skip != 'true'
+        id: phpver
+        run: |
+          set -euo pipefail
+          VERSION=$(docker run --rm "php:${PHP_TAG}" php -r 'echo PHP_VERSION;')
+          DATE=$(date -u +%Y%m%d)
+          echo "PHP version: ${VERSION}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "date=${DATE}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        if: steps.decide.outputs.skip != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          pull: true
+          provenance: false
+          build-args: |
+            PHP_TAG=${{ env.PHP_TAG }}
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.phpver.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ steps.phpver.outputs.date }}
+            org.opencontainers.image.base.name=docker.io/library/php:${{ env.PHP_TAG }}
+            org.opencontainers.image.base.digest=${{ steps.base.outputs.digest }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          if [ "${{ steps.decide.outputs.skip }}" = "true" ]; then
+            echo "### No rebuild" >> "$GITHUB_STEP_SUMMARY"
+            echo "Base image \`php:${PHP_TAG}\` digest unchanged (\`${{ steps.base.outputs.digest }}\`)." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### Built & pushed" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "- \`${REGISTRY}/${IMAGE_NAME}:latest\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- \`${REGISTRY}/${IMAGE_NAME}:${{ steps.phpver.outputs.version }}\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "- \`${REGISTRY}/${IMAGE_NAME}:${{ steps.phpver.outputs.version }}-${{ steps.phpver.outputs.date }}\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
