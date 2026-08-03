@@ -19,11 +19,6 @@ on:
     paths:
       - 'Dockerfile'
       - '.github/workflows/build-image.yml'
-    paths-ignore:
-      - 'README.md'
-      - '*.md'
-      - '.gitignore'
-      - 'LICENSE'
 
 env:
   REGISTRY: ghcr.io
