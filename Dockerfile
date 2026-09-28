@@ -2,7 +2,9 @@ ARG PHP_TAG=8.5-apache
 FROM php:${PHP_TAG}
 
 # Combine RUN commands to reduce layers and clean up in same layer
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# PIE (successor to PECL) is bind-mounted for this step only, so it is not left in the image
+RUN --mount=type=bind,from=ghcr.io/php/pie:1-bin,source=/pie,target=/usr/local/bin/pie \
+    apt-get update && apt-get install -y --no-install-recommends \
         # For memcached extension
         libmemcached-dev \
         libssl-dev \
@@ -13,17 +15,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libpng-dev \
         # For imagick extension
         libmagickwand-dev \
+        # ImageMagick CLI (magick/convert), e.g. for DokuWiki's im_convert
+        imagemagick \
         # For zip extension
         libzip-dev \
-        # Runtime utilities
+        # Runtime utilities (unzip is also used by PIE to extract sources)
         openssl \
         zip \
         unzip \
         # LDAP
         libldap2-dev \
-    # Install PECL extensions
-    && pecl install memcached imagick \
-    && docker-php-ext-enable memcached imagick \
+    # Install extensions via PIE (enabled automatically through docker-php-ext-enable);
+    # build tools come from the base image's PHPIZE_DEPS, so skip PIE's libtoolize check
+    && pie install --no-cache --no-build-tools-check \
+        php-memcached/php-memcached \
+        imagick/imagick \
     # Configure and install GD
     && docker-php-ext-configure gd --with-freetype --with-jpeg \
     # Install bundled extensions
