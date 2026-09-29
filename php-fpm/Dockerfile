@@ -122,6 +122,9 @@ opcache.interned_strings_buffer=32\n\
 opcache.max_accelerated_files=10000\n\
 opcache.validate_timestamps=0\n\
 opcache.revalidate_freq=0\n\
+; Map PHP-FPM'"'"'s own code into huge pages (fewer TLB misses); needs the host'"'"'s\n\
+; transparent huge pages in "madvise" or "always" mode, otherwise it is a no-op\n\
+opcache.huge_code_pages=1\n\
 \n\
 [PHP]\n\
 ; Cache resolved file paths longer (DokuWiki is file-based)\n\
