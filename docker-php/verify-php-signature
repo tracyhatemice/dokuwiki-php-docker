@@ -1,0 +1,33 @@
+#!/bin/sh
+# Verifies a PHP source tarball against a keyring of PHP release managers' public keys
+# (php.net's https://www.php.net/distributions/php-keyring.gpg), and accepts only a signature
+# made by one of the fingerprints pinned in $GPG_KEYS, so the keyring itself need not be trusted.
+# Not from docker-library/php: it replaces upstream's keyserver lookup, so the build does not
+# depend on keyserver.ubuntu.com being reachable.
+#
+#   verify-php-signature <tarball> <signature> <keyring>
+set -eu
+
+[ $# -eq 3 ] || { echo >&2 "usage: $0 <tarball> <signature> <keyring>"; exit 2; }
+tarball=$1
+signature=$2
+keys=$3
+[ -n "${GPG_KEYS:-}" ] || { echo >&2 "GPG_KEYS is empty"; exit 1; }
+
+GNUPGHOME="$(mktemp -d)"
+export GNUPGHOME
+trap 'gpgconf --kill all 2>/dev/null || :; rm -rf "$GNUPGHOME"' EXIT
+
+gpg --batch --quiet --import "$keys"
+# The keyring must hold every pinned fingerprint
+for key in $GPG_KEYS; do
+	gpg --batch --list-keys "$key" > /dev/null 2>&1 || { echo >&2 "$keys lacks pinned key $key"; exit 1; }
+done
+
+# VALIDSIG's last field is the signing key's primary fingerprint
+signer="$(gpg --batch --status-fd 1 --verify "$signature" "$tarball" 2>/dev/null | awk '$2 == "VALIDSIG" { print $NF }')"
+[ -n "$signer" ] || { echo >&2 "no valid signature on $tarball"; exit 1; }
+case " $GPG_KEYS " in
+	*" $signer "*) echo "Good signature on $tarball from pinned key $signer" ;;
+	*) echo >&2 "$tarball is signed by $signer, which is not in GPG_KEYS"; exit 1 ;;
+esac

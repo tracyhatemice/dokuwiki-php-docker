@@ -1,0 +1,145 @@
+name: Watch for PHP releases
+
+# Opens a PR that bumps the PHP source pin in both PHP Dockerfiles when php.net publishes
+# a newer release of the pinned minor version. Merging the PR builds and publishes the images.
+# Needs Settings > Actions > General > "Allow GitHub Actions to create and approve pull requests".
+
+on:
+  schedule:
+    # Every 2 hours, so a release is proposed the same day
+    - cron: '17 */2 * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Open a bump PR for this exact version even if a PR for it existed before (e.g. 8.5.13)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: php-release-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      # PRs target the branch this run was started on (main for scheduled runs)
+      BASE: ${{ github.ref_name }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Test the pin scripts
+        run: tests/run.sh
+
+      - name: Look for a newer PHP release
+        id: target
+        env:
+          REQUESTED: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          scripts/php-pin.sh check Dockerfile php-fpm/Dockerfile
+          CUR=$(scripts/php-pin.sh get Dockerfile)
+          QUERY=${REQUESTED:-${CUR%.*}}
+          RELEASE=$(curl -fsS --retry 3 "https://www.php.net/releases/index.php?json&version=${QUERY}" \
+            | scripts/php-release.sh)
+          read -r TARGET SHA SEC <<<"${RELEASE}"
+          echo "Pinned ${CUR}; php.net offers ${TARGET} (${SEC})"
+
+          if scripts/php-pin.sh is-newer "${TARGET}" "${CUR}"; then
+            :
+          else
+            rc=$?
+            [ "${rc}" -eq 1 ] || exit "${rc}"
+            echo "Up to date."
+            echo "bump=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          BRANCH="php-bump/${TARGET}"
+          if [ -z "${REQUESTED}" ]; then
+            # Any PR for this version from our own branch, open or closed, means it was already proposed
+            PROPOSED=$(scripts/bump-prs.sh proposed "${BRANCH}")
+            if [ "${PROPOSED}" = yes ]; then
+              echo "Already proposed in a PR from ${BRANCH}."
+              echo "bump=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          {
+            echo "TARGET=${TARGET}"
+            echo "SHA=${SHA}"
+            echo "SEC=${SEC}"
+            echo "BRANCH=${BRANCH}"
+          } >> "$GITHUB_ENV"
+          echo "bump=true" >> "$GITHUB_OUTPUT"
+
+      - name: Pin the new release
+        if: steps.target.outputs.bump == 'true'
+        run: |
+          set -euo pipefail
+          scripts/php-pin.sh set "${TARGET}" "${SHA}" Dockerfile php-fpm/Dockerfile
+          scripts/php-pin.sh check Dockerfile php-fpm/Dockerfile
+
+      # PRs opened with GITHUB_TOKEN trigger no other workflows, so this is the PR's test
+      - name: Build and smoke-test both images
+        id: test
+        if: steps.target.outputs.bump == 'true'
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          docker build -t local/dokuwiki-apache apache
+          docker build -t local/php-apache .
+          docker build -t local/php-fpm php-fpm
+          tests/smoke.sh apache local/php-apache "${TARGET}"
+          tests/smoke.sh fpm local/php-fpm "${TARGET}" local/dokuwiki-apache
+
+      - name: Close superseded bump PRs
+        if: steps.target.outputs.bump == 'true'
+        run: |
+          set -euo pipefail
+          scripts/bump-prs.sh superseded "${BASE}" "${BRANCH}" | while read -r number; do
+              gh pr close "${number}" --delete-branch --comment "Superseded by PHP ${TARGET}."
+            done
+
+      - name: Push the bump branch
+        if: steps.target.outputs.bump == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -C "${BRANCH}"
+          git commit -am "Bump PHP to ${TARGET}"
+          git push --force origin "${BRANCH}"
+
+      - name: Open or update the PR
+        if: steps.target.outputs.bump == 'true'
+        env:
+          OUTCOME: ${{ steps.test.outcome }}
+        run: |
+          set -euo pipefail
+          TITLE="Bump PHP to ${TARGET}"
+          if [ "${SEC}" = security ]; then TITLE="[security] ${TITLE}"; fi
+          if [ "${OUTCOME}" = success ]; then RESULT=passed; else RESULT=FAILED; fi
+          BODY=$(printf '%s\n\n%s\n\n%s\n' \
+            "php.net released PHP ${TARGET}. ChangeLog: https://www.php.net/ChangeLog-${TARGET%%.*}.php#${TARGET}" \
+            "Test build and smoke test: ${RESULT} — see ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            "Merging this PR builds and publishes both PHP images.")
+          EXISTING=$(scripts/bump-prs.sh open "${BRANCH}")
+          if [ -n "${EXISTING}" ]; then
+            gh pr edit "${EXISTING}" --title "${TITLE}" --body "${BODY}"
+          else
+            gh pr create --base "${BASE}" --head "${BRANCH}" --title "${TITLE}" --body "${BODY}"
+          fi
+
+      - name: Fail if the test build failed
+        if: steps.target.outputs.bump == 'true' && steps.test.outcome == 'failure'
+        run: |
+          echo "::error::Build or smoke test failed for PHP ${TARGET}; the PR says so."
+          exit 1
