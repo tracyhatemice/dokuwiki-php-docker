@@ -4,12 +4,10 @@ on:
   schedule:
     # Daily at 00:00 UTC
     - cron: '0 0 * * *'
+    # Weekly, Sunday 04:00 UTC: full rebuild without cache, picks up Debian package updates
+    - cron: '0 4 * * 0'
   workflow_dispatch:
     inputs:
-      php_tag:
-        description: 'PHP base image tag for dokuwiki-php-fpm (e.g. 8.5-fpm, 8.4-fpm)'
-        default: '8.5-fpm'
-        required: true
       force:
         description: 'Build & push even if base images unchanged'
         type: boolean
@@ -34,24 +32,33 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # PHP is built from source on Debian; the version comes from the Dockerfile pin
           - image: dokuwiki-php-fpm
             context: php-fpm
-            base: php
-            base_tag: ${{ inputs.php_tag || '8.5-fpm' }}
-            tag_arg: PHP_TAG
-            version_cmd: php -r 'echo PHP_VERSION;'
+            base: debian
+            base_tag: trixie-slim
+            build_args: ''
+            pin_file: php-fpm/Dockerfile
+            version_cmd: scripts/php-pin.sh get php-fpm/Dockerfile
           - image: dokuwiki-apache
             context: apache
             base: httpd
             base_tag: '2.4'
-            tag_arg: HTTPD_TAG
-            version_cmd: httpd -v | sed -n 's|.*Apache/\([0-9.]*\).*|\1|p'
+            build_args: HTTPD_TAG=2.4
+            pin_file: ''
+            version_cmd: docker run --rm "$BASE_IMAGE" httpd -v | sed -n 's|.*Apache/\([0-9.]*\).*|\1|p'
     env:
       IMAGE_NAME: ${{ github.repository_owner }}/${{ matrix.image }}
       BASE_IMAGE: ${{ matrix.base }}:${{ matrix.base_tag }}
 
     steps:
       - uses: actions/checkout@v7
+
+      - name: Check PHP pin
+        run: |
+          set -euo pipefail
+          scripts/php-pin.sh check Dockerfile php-fpm/Dockerfile
+          diff -r --exclude=docker-php-entrypoint --exclude=apache2-foreground docker-php php-fpm/docker-php
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -78,41 +85,20 @@ jobs:
           IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           NEW_BASE: ${{ steps.base.outputs.digest }}
           EVENT: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
           FORCE: ${{ inputs.force }}
-        run: |
-          set -euo pipefail
-          if [ "${EVENT}" != "schedule" ] || [ "${FORCE}" = "true" ]; then
-            echo "Trigger=${EVENT} force=${FORCE}: build."
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          # Schedule trigger: skip if previous build used the same base digest.
-          if ! docker pull "${IMAGE_REF}" >/dev/null 2>&1; then
-            echo "No previous :latest in registry; building."
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          PREV=$(docker inspect "${IMAGE_REF}" \
-            --format '{{ index .Config.Labels "org.opencontainers.image.base.digest" }}' \
-            2>/dev/null || true)
-          echo "Previous base digest: ${PREV:-<none>}"
-          echo "Current  base digest: ${NEW_BASE}"
-          if [ -n "${PREV}" ] && [ "${PREV}" = "${NEW_BASE}" ]; then
-            echo "Base unchanged; skipping rebuild."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
+          PIN_FILE: ${{ matrix.pin_file }}
+        run: scripts/decide-build.sh
 
-      - name: Resolve version from base image
+      - name: Resolve image version
         if: steps.decide.outputs.skip != 'true'
         id: ver
         env:
           VERSION_CMD: ${{ matrix.version_cmd }}
         run: |
           set -euo pipefail
-          VERSION=$(docker run --rm "${BASE_IMAGE}" sh -c "${VERSION_CMD}")
-          [ -n "${VERSION}" ] || { echo "Could not determine version from ${BASE_IMAGE}"; exit 1; }
+          VERSION=$(bash -c "${VERSION_CMD}")
+          [ -n "${VERSION}" ] || { echo "Could not determine version for ${{ matrix.image }}"; exit 1; }
           DATE=$(date -u +%Y%m%d)
           echo "Version: ${VERSION}"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
@@ -125,9 +111,9 @@ jobs:
           context: ${{ matrix.context }}
           push: true
           pull: true
+          no-cache: ${{ steps.decide.outputs.no_cache == 'true' }}
           provenance: false
-          build-args: |
-            ${{ matrix.tag_arg }}=${{ matrix.base_tag }}
+          build-args: ${{ matrix.build_args }}
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.version }}

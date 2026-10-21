@@ -4,12 +4,10 @@ on:
   schedule:
     # Daily at 00:00 UTC
     - cron: '0 0 * * *'
+    # Weekly, Sunday 04:00 UTC: full rebuild without cache, picks up Debian package updates
+    - cron: '0 4 * * 0'
   workflow_dispatch:
     inputs:
-      php_tag:
-        description: 'PHP base image tag (e.g. 8.5-apache, 8.4-apache, 8-apache)'
-        default: '8.5-apache'
-        required: true
       force:
         description: 'Build & push even if base image unchanged'
         type: boolean
@@ -18,12 +16,13 @@ on:
     branches: [main]
     paths:
       - 'Dockerfile'
+      - 'docker-php/**'
       - '.github/workflows/build-image.yml'
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
-  PHP_TAG: ${{ inputs.php_tag || '8.5-apache' }}
+  BASE_IMAGE: debian:trixie-slim
 
 jobs:
   build:
@@ -34,6 +33,12 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+
+      - name: Check PHP pin
+        run: |
+          set -euo pipefail
+          scripts/php-pin.sh check Dockerfile php-fpm/Dockerfile
+          diff -r --exclude=docker-php-entrypoint --exclude=apache2-foreground docker-php php-fpm/docker-php
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -49,9 +54,9 @@ jobs:
         id: base
         run: |
           set -euo pipefail
-          BASE_DIGEST=$(docker buildx imagetools inspect "php:${PHP_TAG}" \
+          BASE_DIGEST=$(docker buildx imagetools inspect "${BASE_IMAGE}" \
             --format '{{json .Manifest}}' | jq -r '.digest')
-          echo "Base php:${PHP_TAG} digest: ${BASE_DIGEST}"
+          echo "Base ${BASE_IMAGE} digest: ${BASE_DIGEST}"
           echo "digest=${BASE_DIGEST}" >> "$GITHUB_OUTPUT"
 
       - name: Decide whether build is needed
@@ -60,38 +65,17 @@ jobs:
           IMAGE_REF: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           NEW_BASE: ${{ steps.base.outputs.digest }}
           EVENT: ${{ github.event_name }}
+          SCHEDULE: ${{ github.event.schedule }}
           FORCE: ${{ inputs.force }}
-        run: |
-          set -euo pipefail
-          if [ "${EVENT}" != "schedule" ] || [ "${FORCE}" = "true" ]; then
-            echo "Trigger=${EVENT} force=${FORCE}: build."
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          # Schedule trigger: skip if previous build used the same base digest.
-          if ! docker pull "${IMAGE_REF}" >/dev/null 2>&1; then
-            echo "No previous :latest in registry; building."
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          PREV=$(docker inspect "${IMAGE_REF}" \
-            --format '{{ index .Config.Labels "org.opencontainers.image.base.digest" }}' \
-            2>/dev/null || true)
-          echo "Previous base digest: ${PREV:-<none>}"
-          echo "Current  base digest: ${NEW_BASE}"
-          if [ -n "${PREV}" ] && [ "${PREV}" = "${NEW_BASE}" ]; then
-            echo "Base unchanged; skipping rebuild."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
+          PIN_FILE: Dockerfile
+        run: scripts/decide-build.sh
 
-      - name: Resolve PHP version from base image
+      - name: Resolve PHP version from the Dockerfile pin
         if: steps.decide.outputs.skip != 'true'
         id: phpver
         run: |
           set -euo pipefail
-          VERSION=$(docker run --rm "php:${PHP_TAG}" php -r 'echo PHP_VERSION;')
+          VERSION=$(scripts/php-pin.sh get Dockerfile)
           DATE=$(date -u +%Y%m%d)
           echo "PHP version: ${VERSION}"
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
@@ -104,9 +88,8 @@ jobs:
           context: .
           push: true
           pull: true
+          no-cache: ${{ steps.decide.outputs.no_cache == 'true' }}
           provenance: false
-          build-args: |
-            PHP_TAG=${{ env.PHP_TAG }}
           tags: |
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.phpver.outputs.version }}
@@ -114,7 +97,7 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.created=${{ steps.phpver.outputs.date }}
-            org.opencontainers.image.base.name=docker.io/library/php:${{ env.PHP_TAG }}
+            org.opencontainers.image.base.name=docker.io/library/${{ env.BASE_IMAGE }}
             org.opencontainers.image.base.digest=${{ steps.base.outputs.digest }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -122,12 +105,15 @@ jobs:
       - name: Summary
         run: |
           if [ "${{ steps.decide.outputs.skip }}" = "true" ]; then
-            echo "### No rebuild" >> "$GITHUB_STEP_SUMMARY"
-            echo "Base image \`php:${PHP_TAG}\` digest unchanged (\`${{ steps.base.outputs.digest }}\`)." >> "$GITHUB_STEP_SUMMARY"
+            {
+              echo "### No rebuild"
+              echo "Base image \`${BASE_IMAGE}\` digest unchanged (\`${{ steps.base.outputs.digest }}\`)."
+            } >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "### Built & pushed" >> "$GITHUB_STEP_SUMMARY"
-            echo "" >> "$GITHUB_STEP_SUMMARY"
-            echo "- \`${REGISTRY}/${IMAGE_NAME}:latest\`" >> "$GITHUB_STEP_SUMMARY"
-            echo "- \`${REGISTRY}/${IMAGE_NAME}:${{ steps.phpver.outputs.version }}\`" >> "$GITHUB_STEP_SUMMARY"
-            echo "- \`${REGISTRY}/${IMAGE_NAME}:${{ steps.phpver.outputs.version }}-${{ steps.phpver.outputs.date }}\`" >> "$GITHUB_STEP_SUMMARY"
+            {
+              echo "### Built & pushed"
+              echo ""
+              echo "- \`${REGISTRY}/${IMAGE_NAME}:latest\`"
+              echo "- \`${REGISTRY}/${IMAGE_NAME}:${{ steps.phpver.outputs.version }}\`"
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
