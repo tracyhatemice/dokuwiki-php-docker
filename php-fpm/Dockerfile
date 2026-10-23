@@ -388,6 +388,7 @@ max_file_uploads=5\n\
 session.use_only_cookies=1\n\
 session.cookie_httponly=1\n\
 session.cookie_secure=1\n\
+session.upload_progress.enabled=0\n\
 session.use_strict_mode=1\n\
 session.use_trans_sid=0\n\
 session.cookie_samesite=Strict\n\
